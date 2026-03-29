@@ -39,7 +39,7 @@ theta = 0.001  # Policy smoothing toward uniform
 alpha = 0.1  # Exponential policy learning rate (also used in dual update momentum)
 # Reward-structure hyperparameters
 TERMINAL_REWARD = 1.0
-SHAPING_WEIGHT = 1.0
+SHAPING_WEIGHT = 0.4
 REWARD_MODE = "phase-flip"  # "stationary", "gradual", or "phase-flip"
 REWARD_BLEND_START = 0.0
 REWARD_BLEND_END = 1.0

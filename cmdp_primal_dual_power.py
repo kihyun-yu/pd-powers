@@ -4,6 +4,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+import warnings
 from random import randrange
 
 try:
@@ -18,13 +19,13 @@ except ImportError:
 # =========================
 dim = 5
 H = 10
-K = 1000
-repeat = 10
+K = 2000
+repeat = 5
 ACTION = 2 ** (dim - 1)
 STATE = H + 2
 
 thetastar = np.append(0.01 * np.ones(dim - 1), 1.0)
-delta = 0.1
+delta = 0.05
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -35,14 +36,14 @@ beta1 = 0.45
 dual_lr = 0.05
 B_CONSTR = 6.0
 theta = 0.001  # Policy smoothing toward uniform
-alpha = 0.5  # Exponential policy learning rate (also used in dual update momentum)
+alpha = 0.1  # Exponential policy learning rate (also used in dual update momentum)
 # Reward-structure hyperparameters
 TERMINAL_REWARD = 1.0
-SHAPING_WEIGHT = 0.4
+SHAPING_WEIGHT = 1.0
 REWARD_MODE = "phase-flip"  # "stationary", "gradual", or "phase-flip"
 REWARD_BLEND_START = 0.0
 REWARD_BLEND_END = 1.0
-REWARD_PHASE_LEN = 100
+REWARD_PHASE_LEN = 10
 MAX_REWARD_PER_STEP = max(TERMINAL_REWARD, SHAPING_WEIGHT)
 
 
@@ -185,17 +186,11 @@ def select_constrained_optimal_action() -> int:
     if has_feasible:
         return best_action
 
-    # Fallback: if no action satisfies the constraint, use best reward action.
-    for action in range(ACTION):
-        reward_sum = 0.0
-        for episode in range(K):
-            exp_reward, _ = expected_episode_values_for_action(action, episode)
-            reward_sum += exp_reward
-        if reward_sum > best_objective:
-            best_objective = reward_sum
-            best_action = action
-
-    return best_action
+    warnings.warn(
+        "No feasible action satisfies the CMDP constraint. Exiting without running experiments.",
+        RuntimeWarning,
+    )
+    raise SystemExit(1)
 
 
 OPTIMAL_FIXED_ACTION = select_constrained_optimal_action()
@@ -586,7 +581,6 @@ if repeat > 1:
         violation_mean + violation_ci,
         alpha=0.2,
     )
-plt.axhline(0.0, color="black", linestyle="--", linewidth=1)
 plt.xlabel("Episode", fontsize=20, labelpad=8)
 plt.ylabel("Constraint Violation", fontsize=20)
 plt.legend(fontsize=20)

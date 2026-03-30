@@ -19,8 +19,7 @@ This repository provides:
 
 ## Reference
 
-Based on:
-- POWERS (AISTATS 2022): https://proceedings.mlr.press/v151/he22a.html
+The implementation is based on: POWERS (AISTATS 2022): https://proceedings.mlr.press/v151/he22a.html
 
 ---
 

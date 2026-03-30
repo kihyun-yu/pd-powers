@@ -9,7 +9,7 @@ Implementation of **PD-POWERS** — a primal-dual policy optimization algorithm 
 
 This repository provides:
 
-- Finite-horizon CMDP with linear transition features  
+- Finite-horizon Linear Mixture CMDP
 - Support for non-stationary rewards  
 - Methods:
   - Random baseline  

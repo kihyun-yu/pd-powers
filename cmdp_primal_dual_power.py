@@ -36,6 +36,10 @@ beta = 0.35
 beta1 = 0.45
 # Illustrative preset: selected to show a modest gap, not a tuned-best ablation.
 BASELINE_BETA = 2.0
+# Independent empirical coefficient for Algorithm 1 of Yu et al. (2026).
+LINEAR_BETA = 16.0
+LINEAR_ALPHA = 0.1  # Appendix L's experimental policy step size.
+LINEAR_LABEL = "Yu et al. 2026"
 BASE_SEED = 4000
 dual_lr = 0.05
 B_CONSTR = 6.0
@@ -414,16 +418,180 @@ def run_primal_dual(*, use_variance=True, seed=BASE_SEED, run=0,
     return np.asarray(reward_history), np.asarray(constr_violation_history)
 
 
-def evaluate_method(use_variance, coefficient, seeds, benchmark):
+def linear_features(state, action):
+    """Known linear-CMDP features: a two-coordinate block per chain state.
+
+    The chain's transition probabilities and signals are affine in action
+    density. Absorbing states have their own indicator coordinates. These
+    features use no transition parameters and have norm at most one.
+    """
+    features = np.zeros(2 * H + 2)
+    if state < H:
+        density = np.mean((trans_action(action, dim) + 1) / 2)
+        features[2 * state:2 * state + 2] = (1 - density, density)
+    else:
+        features[2 * H + state - H] = 1.
+    return features
+
+
+def linear_settings(coefficient):
+    """Appendix L's empirical convention, with independently chosen beta_b."""
+    return {"paper": "https://arxiv.org/abs/2605.11535", "algorithm": 1,
+            "feature_dimension": 2 * H + 2, "beta_b": coefficient,
+            "beta_w": coefficient * float(np.log(K)), "alpha": LINEAR_ALPHA,
+            "eta": H**-2 * K**-0.75, "theta": 1 / K,
+            "mixing_period": max(1, int(np.ceil(K**0.75))),
+            "cost_budget": H - B_CONSTR, "ridge": 1.0}
+
+
+def run_linear_cmdp(*, seed=BASE_SEED, beta_value=None, diagnostics=None):
+    """Yu et al. (2026), Algorithm 1, on the SAME chain as PD-POWERS.
+
+    Loss = 1 - reward, paper cost = 1 - utility, paper budget = H - B_CONSTR.
+    Keep pre-episode regressions, epoch-frozen contraction/bonuses, determinant
+    doubling resets, periodic pre-update mixing, and the factor-4 dual rule.
+    Only three feature coordinates are reachable at a given stage. Restricting
+    the block-diagonal ridge system to these coordinates is exact. Sums of
+    feature vectors grouped by successor retain ALL past samples and allow
+    reevaluation with current values without an O(K**2) history scan.
+    """
+    coefficient = LINEAR_BETA if beta_value is None else beta_value
+    if not np.isfinite(coefficient) or coefficient < 0:
+        raise ValueError("beta must be finite and nonnegative")
+    if not np.allclose(thetastar[:-1], thetastar[0], rtol=0, atol=1e-14):
+        raise ValueError("The density feature map requires equal action transition coefficients")
+    if not (0 <= SHAPING_WEIGHT <= 1 and 0 <= TERMINAL_REWARD <= 1):
+        raise ValueError("The linear baseline requires reward in [0, 1]")
+    settings = linear_settings(coefficient)
+    step_size, eta, mixing = settings["alpha"], settings["eta"], settings["theta"]
+    rng = np.random.RandomState(seed)
+    density = np.array([np.mean((trans_action(a, dim) + 1) / 2) for a in range(ACTION)])
+    utilities = np.array([cost(0, a) for a in range(ACTION)])
+    # Coordinates: the current chain state's two entries, then the good absorber.
+    features = np.zeros((2, ACTION, 3))
+    features[0, :, :2] = np.column_stack((1 - density, density))
+    features[1, :, 2] = 1.
+    flat_features = features.reshape(-1, 3)
+    continuation = np.array([proba(0, a, 1) for a in range(ACTION)])
+    rewards = np.array([[reward(0, a, k) for a in range(ACTION)] for k in range(K)])
+    policy = np.full((H, 2, ACTION), 1 / ACTION)
+    design = np.repeat(np.eye(3)[None, :, :], H, axis=0)
+    cost_sum = np.zeros((H, 3))
+    transition_sum = np.zeros((H, 3, 2))
+    values = np.zeros((H + 1, 2, 2))  # stage, state kind, loss/cost
+    dual = 0.
+    epoch_start = 0
+    epoch_logdet = np.zeros(H)
+    contractions = np.ones((H, 2, ACTION))
+    radii = np.zeros_like(contractions)
+    reward_history, deficit_history = [], []
+    total_reward, total_deficit = 0., 0.
+    if diagnostics is not None:
+        diagnostics.clear()
+        diagnostics.update(expected_reward=np.zeros(K), expected_utility=np.zeros(K),
+                           dual=np.zeros(K), epoch_starts=[], mixing_episodes=[],
+                           mean_contraction=np.zeros(K))
+    for episode in range(K):
+        logdet = np.linalg.slogdet(design)[1]
+        # Include equality despite rounding differences at exact determinant doubling.
+        if episode == 0 or np.any(logdet >= epoch_logdet + np.log(2) - 1e-12):
+            # Algorithm 1, lines 2–6: reset policy and dual, retain observations.
+            epoch_start = episode
+            epoch_logdet = logdet.copy()
+            policy.fill(1 / ACTION)
+            dual = 0.
+            for h in range(H):
+                solved = np.linalg.solve(design[h], flat_features.T).T
+                radii[h] = np.sqrt(np.maximum(0, np.sum(flat_features * solved, axis=1))).reshape(2, ACTION)
+            logits = np.log(K) - settings["beta_w"] * radii
+            contractions = np.exp(-np.logaddexp(0, -logits))
+            if diagnostics is not None:
+                diagnostics["epoch_starts"].append(episode + 1)
+
+        if diagnostics is not None:
+            occupancy = 1.
+            for h in range(H):
+                probabilities = policy[h, 0]
+                diagnostics["expected_reward"][episode] += (
+                    occupancy * np.dot(probabilities, rewards[episode])
+                    + (1 - occupancy) * TERMINAL_REWARD)
+                diagnostics["expected_utility"][episode] += occupancy * np.dot(probabilities, utilities)
+                occupancy *= np.dot(probabilities, continuation)
+            diagnostics["mean_contraction"][episode] = contractions.mean()
+
+        # Rollout feedback. The critic below uses only observations BEFORE this
+        # episode, as specified by Lambda^k and tau in [k-1] in lines 14 and 16.
+        observed_features = np.zeros((H, 3))
+        observed_costs = np.zeros(H)
+        successors = np.zeros(H, dtype=int)
+        state_kind, episode_utility = 0, 0.
+        for h in range(H):
+            action = rng.choice(ACTION, p=policy[h, state_kind])
+            utility = utilities[action] if state_kind == 0 else 0.
+            total_reward += rewards[episode, action] if state_kind == 0 else TERMINAL_REWARD
+            episode_utility += utility
+            reward_history.append(total_reward)
+            observed_features[h] = features[state_kind, action]
+            observed_costs[h] = 1 - utility
+            if state_kind == 0:
+                state_kind = 1 - rng.binomial(1, continuation[action])
+            successors[h] = state_kind
+
+        mix_now = (episode - epoch_start) % settings["mixing_period"] == 0
+        if diagnostics is not None and mix_now:
+            diagnostics["mixing_episodes"].append(episode + 1)
+        # Full-information LOSS feedback; no unsampled utility values enter a fit.
+        loss_parameter = np.array([1 - rewards[episode, 0],
+                                   1 - rewards[episode, ACTION - 1], 1 - TERMINAL_REWARD])
+        for h in reversed(range(H)):
+            rhs = transition_sum[h] @ values[h + 1]
+            rhs[:, 1] += cost_sum[h]
+            fitted = np.linalg.solve(design[h], rhs)
+            fitted[:, 0] += loss_parameter
+            q_values = contractions[h, :, :, None] * (
+                features @ fitted - coefficient * radii[h, :, :, None])
+            # Values use the deployed policy, before mixing/optimization. No Q clipping.
+            values[h] = np.sum(policy[h, :, :, None] * q_values, axis=1)
+            mixed = (1 - mixing) * policy[h] + mixing / ACTION if mix_now else policy[h]
+            with np.errstate(divide="ignore"):
+                log_weights = np.log(mixed) - step_size * (q_values[:, :, 0] + dual * q_values[:, :, 1])
+            weights = np.exp(log_weights - log_weights.max(axis=1, keepdims=True))
+            policy[h] = weights / weights.sum(axis=1, keepdims=True)
+
+        # Algorithm 1, line 27: unnormalized cost value and the factor-4 penalties.
+        dual = max(0., (1 - 4 * step_size * eta * H**3) * dual
+                   + eta * (values[0, 0, 1] - settings["cost_budget"]
+                            - 4 * step_size * H**3 - 4 * mixing * H**2))
+        # Commit the current episode only after its pre-episode critic fits.
+        for h in range(H):
+            feature = observed_features[h]
+            design[h] += np.outer(feature, feature)
+            cost_sum[h] += feature * observed_costs[h]
+            transition_sum[h, :, successors[h]] += feature
+        total_deficit += B_CONSTR - episode_utility
+        deficit_history.append(total_deficit)
+        if diagnostics is not None:
+            diagnostics["dual"][episode] = dual
+    if diagnostics is not None:
+        diagnostics.update(final_policy=policy[:, 0].copy(), final_design=design.copy(),
+                           final_cost_sum=cost_sum.copy(), final_transition_sum=transition_sum.copy())
+    return np.asarray(reward_history), np.asarray(deficit_history)
+
+
+def evaluate_method(use_variance, coefficient, seeds, benchmark, *, linear=False):
     """Keep genuine sampled histories and score exact deployed policy values."""
     runs, histories = [], []
-    label = "PD-POWERS" if use_variance else "PD-POWERS without variance"
+    label = LINEAR_LABEL if linear else ("PD-POWERS" if use_variance else "PD-POWERS without variance")
     for run, seed in enumerate(seeds):
         diagnostics = {}
-        observed_reward, observed_deficit = run_primal_dual(
-            use_variance=use_variance, seed=seed, run=run, beta_value=coefficient,
-            diagnostics=diagnostics,
-        )
+        if linear:
+            observed_reward, observed_deficit = run_linear_cmdp(
+                seed=seed, beta_value=coefficient, diagnostics=diagnostics)
+        else:
+            observed_reward, observed_deficit = run_primal_dual(
+                use_variance=use_variance, seed=seed, run=run, beta_value=coefficient,
+                diagnostics=diagnostics,
+            )
         regret = np.cumsum(benchmark - diagnostics["expected_reward"])
         deficit = np.cumsum(B_CONSTR - diagnostics["expected_utility"])
         histories.append({"regret": regret, "deficit": deficit,
@@ -436,12 +604,18 @@ def evaluate_method(use_variance, coefficient, seeds, benchmark):
                      "mean_utility": float(diagnostics["expected_utility"].mean()),
                      "sampled_violation": float(max(0, observed_deficit[-1])),
                      "dual_max": float(diagnostics["dual"].max()),
-                     "reward_floor_fraction": diagnostics["r_floor_hits"] / max(1, K * (H - 1)) if use_variance else None,
-                     "utility_floor_fraction": diagnostics["g_floor_hits"] / max(1, K * (H - 1)) if use_variance else None})
+                     "reward_floor_fraction": diagnostics["r_floor_hits"] / max(1, K * (H - 1)) if use_variance and not linear else None,
+                     "utility_floor_fraction": diagnostics["g_floor_hits"] / max(1, K * (H - 1)) if use_variance and not linear else None})
+        if linear:
+            runs[-1].update(epochs=len(diagnostics["epoch_starts"]),
+                            mixing_steps=len(diagnostics["mixing_episodes"]),
+                            mean_contraction=float(diagnostics["mean_contraction"].mean()))
         print(f"{label}, beta={coefficient:g}, seed={seed}: regret={regret[-1]:.2f}, "
               f"violation={max(0, deficit[-1]):.2f}", flush=True)
-    summary = {"label": label, "use_variance": use_variance,
-               "beta": coefficient, "beta1": beta1 if use_variance else None, "runs": runs}
+    summary = {"label": label, "use_variance": use_variance and not linear,
+               "beta": coefficient, "beta1": beta1 if use_variance and not linear else None, "runs": runs}
+    if linear:
+        summary["algorithm_settings"] = linear_settings(coefficient)
     for metric in ("regret", "violation", "peak_violation", "mean_utility"):
         summary[f"mean_{metric}"] = float(np.mean([row[metric] for row in runs]))
     return summary, {key: np.asarray([row[key] for row in histories]) for key in histories[0]}
@@ -458,6 +632,32 @@ def choose_illustrative_candidate(reference, candidates, target_gap=0.10):
                              and row["violation_difference"] >= 0)
     eligible = [row for row in candidates if row["target_met"]]
     return min(eligible or candidates, key=lambda row: abs(row["regret_gap_fraction"] - target_gap))
+
+
+def choose_near_random_candidate(reference, candidates, target_improvement=0.08):
+    """Illustrative selection: 2–15% below Random on BOTH final metrics."""
+    if min(reference["mean_regret"], reference["mean_violation"]) <= 0:
+        raise ValueError("Near-Random selection requires positive Random regret and violation")
+    for row in candidates:
+        improvements = [1 - row[f"mean_{metric}"] / reference[f"mean_{metric}"]
+                        for metric in ("regret", "violation")]
+        row.update(regret_improvement_over_random=improvements[0],
+                   violation_improvement_over_random=improvements[1],
+                   target_met=all(.02 <= value <= .15 for value in improvements),
+                   selection_distance=sum((value - target_improvement)**2 for value in improvements))
+    eligible = [row for row in candidates if row["target_met"]]
+    return min(eligible or candidates, key=lambda row: row["selection_distance"])
+
+
+def random_policy_curves(benchmark):
+    """Exact uniform-policy values; used for the plot and calibration reference."""
+    p_continue = np.mean([proba(0, a, 1) for a in range(ACTION)])
+    active_steps = sum(p_continue**h for h in range(H))
+    random_reward = np.array([active_steps * np.mean([reward(0, a, k) for a in range(ACTION)])
+                              + (H - active_steps) * TERMINAL_REWARD for k in range(K)])
+    random_utility = active_steps * np.mean([cost(0, a) for a in range(ACTION)])
+    return {"random_regret": np.cumsum(benchmark - random_reward)[None, :],
+            "random_deficit": np.cumsum(np.full(K, B_CONSTR - random_utility))[None, :]}
 
 
 def save_json(path, data):
@@ -481,9 +681,10 @@ def paired_comparison(baseline, reference):
 
 def plot_comparison(curves, output_dir):
     """Use the original single-panel style with algorithm-only legends."""
-    labels = {"random": "Random", "pd_powers": "PD-POWERS",
-              "novar": "PD-POWERS w/o Var"}
-    styles = {"novar": "--"}
+    labels = {"random": "Random", "linear_cmdp": LINEAR_LABEL,
+              "novar": "PD-POWERS w/o Var", "pd_powers": "PD-POWERS (Ours)"}
+    styles = {"novar": "--", "linear_cmdp": "-."}
+    colors = {"random": "C0", "pd_powers": "C1", "novar": "C2", "linear_cmdp": "C3"}
     episodes = np.arange(1, K + 1)
     for metric, filename, ylabel in (("regret", "regret_plot.jpg", "Regret"),
                                      ("violation", "violation_plot.jpg", "Constraint Violation")):
@@ -494,7 +695,7 @@ def plot_comparison(curves, output_dir):
                 values = np.maximum(0, values)
             mean = values.mean(axis=0)
             line, = ax.plot(episodes, mean, label=labels[name],
-                            linestyle=styles.get(name, "-"))
+                            linestyle=styles.get(name, "-"), color=colors[name])
             if len(values) > 1:
                 half_width = 1.96 * values.std(axis=0, ddof=1) / np.sqrt(len(values))
                 ax.fill_between(episodes, mean - half_width, mean + half_width,
@@ -502,12 +703,12 @@ def plot_comparison(curves, output_dir):
         ax.set_ylabel(ylabel, fontsize=20)
         if metric == "violation":
             ax.set_xlabel("Episode", fontsize=20, labelpad=8)
-        ax.legend(fontsize=20)
+        ax.legend(fontsize=14)
         fig.tight_layout()
         fig.subplots_adjust(bottom=0.16)
         # Keep the preset's illustrative purpose visible without a large title.
-        fig.text(0.5, 0.015, "Illustrative hyperparameter comparison",
-                 ha="center", fontsize=8, color="0.4")
+        # fig.text(0.5, 0.015, "Illustrative hyperparameter comparison",
+        #          ha="center", fontsize=8, color="0.4")
         try:
             fig.savefig(output_dir / filename, dpi=150)
         finally:
@@ -516,8 +717,10 @@ def plot_comparison(curves, output_dir):
 
 def main():
     global K
-    parser = argparse.ArgumentParser(description="Original PD-POWERS plus an explicitly illustrative no-variance baseline.")
+    parser = argparse.ArgumentParser(description="PD-POWERS, its no-variance ablation, and Yu et al.'s linear CMDP baseline; illustrative hyperparameters.")
     parser.add_argument("--baseline-beta", type=float, default=BASELINE_BETA)
+    parser.add_argument("--linear-beta", type=float, default=LINEAR_BETA,
+                        help="Independent beta_b for the linear CMDP baseline; beta_w = beta_b * log(K)")
     parser.add_argument("--episodes", type=int, default=K)
     parser.add_argument("--seeds", type=int, nargs="+", default=list(range(BASE_SEED, BASE_SEED + repeat)))
     parser.add_argument("--output-dir", type=Path,
@@ -525,16 +728,20 @@ def main():
     parser.add_argument("--calibrate-demo", action="store_true",
                         help="Choose no-var beta to target a 5–15%% illustrative regret gap, not its best performance")
     parser.add_argument("--beta-grid", type=float, nargs="+", default=[0.35, 0.75, 1.25, 1.75, 1.9, 2.0, 2.1, 2.25, 2.75])
+    parser.add_argument("--calibrate-linear-demo", action="store_true",
+                        help="Choose linear beta for final regret and violation 2–15%% below Random, not best performance")
+    parser.add_argument("--linear-beta-grid", type=float, nargs="+",
+                        help="Calibration grid; defaults to 0.35, 1, 2, 4, K**0.25, 8, 16, 32")
     args = parser.parse_args()
     if args.episodes < 1 or not args.seeds or len(set(args.seeds)) != len(args.seeds):
         parser.error("Provide positive episodes and unique evaluation seeds")
     if not all(0 <= seed < 2**32 for seed in args.seeds):
         parser.error("Seeds must be in [0, 2**32)")
     if not all(np.isfinite(value) and value >= 0 for value in
-               [args.baseline_beta, *args.beta_grid]):
+               [args.baseline_beta, args.linear_beta, *args.beta_grid, *(args.linear_beta_grid or [])]):
         parser.error("Beta values must be finite and nonnegative")
     calibration_seeds = [100, 101, 102, 103, 104]
-    if args.calibrate_demo and set(args.seeds) & set(calibration_seeds):
+    if (args.calibrate_demo or args.calibrate_linear_demo) and set(args.seeds) & set(calibration_seeds):
         parser.error("Evaluation and calibration seeds must be disjoint")
     K = args.episodes
     project_dir = Path(__file__).resolve().parent
@@ -545,6 +752,7 @@ def main():
     print(f"Results directory: {args.output_dir}\nPlots are updated after all runs finish.", flush=True)
     action = select_constrained_optimal_action()
     benchmark = np.asarray([expected_episode_values_for_action(action, k)[0] for k in range(K)])
+    random_curves = random_policy_curves(benchmark)
     settings = {name: globals()[name] for name in (
         "dim", "H", "K", "ACTION", "STATE", "delta", "LAMBDA", "beta", "beta1", "dual_lr",
         "B_CONSTR", "theta", "alpha", "TERMINAL_REWARD", "SHAPING_WEIGHT", "REWARD_MODE",
@@ -571,29 +779,48 @@ def main():
             print("No candidate met the requested gap. Expand the calibration grid before evaluation.", flush=True)
             return
 
+    linear_coefficient = args.linear_beta
+    if args.calibrate_linear_demo:
+        search = {"purpose": "illustrative proximity to Random; not best-performance tuning",
+                  "settings": settings, "calibration_seeds": calibration_seeds,
+                  "evaluation_seeds": args.seeds, "target_improvement_over_random": [.02, .15],
+                  "target_center": .08, "paper_empirical_beta": K**.25,
+                  "reference": {"mean_regret": float(random_curves["random_regret"][0, -1]),
+                                "mean_violation": float(max(0, random_curves["random_deficit"][0, -1]))},
+                  "candidates": []}
+        grid = args.linear_beta_grid or [.35, 1., 2., 4., K**.25, 8., 16., 32.]
+        for candidate in grid:
+            row, _ = evaluate_method(False, candidate, calibration_seeds, benchmark, linear=True)
+            search["candidates"].append(row)
+            save_json(args.output_dir / "linear_calibration.json", search)
+        selected = choose_near_random_candidate(search["reference"], search["candidates"])
+        search.update(selected_beta=selected["beta"], target_met=selected["target_met"])
+        linear_coefficient = selected["beta"]
+        save_json(args.output_dir / "linear_calibration.json", search)
+        print(f"Illustrative linear beta={linear_coefficient:g}; calibration target met={selected['target_met']}", flush=True)
+        if not selected["target_met"]:
+            print("No candidate met the near-Random target. Expand the calibration grid before evaluation.", flush=True)
+            return
+
     summary = {"purpose": "illustrative hyperparameter comparison; not a tuned-best ablation",
+               "linear_selection": "Beta selected for proximity to Random, not to optimize the paper's algorithm.",
                "settings": settings, "evaluation_seeds": args.seeds,
                "benchmark": {"type": "best feasible deterministic fixed action", "action": action},
                "metric": "Exact expected deployed-policy values; positive part of cumulative utility deficit",
                "methods": {}}
-    curves = {"benchmark_reward": benchmark}
-    for name, use_variance, method_beta in (
-        ("pd_powers", True, beta),
-        ("novar", False, coefficient),
+    curves = {"benchmark_reward": benchmark, **random_curves}
+    for name, use_variance, method_beta, linear in (
+        ("pd_powers", True, beta, False),
+        ("novar", False, coefficient, False),
+        ("linear_cmdp", False, linear_coefficient, True),
     ):
         summary["methods"][name], histories = evaluate_method(
-            use_variance, method_beta, args.seeds, benchmark)
+            use_variance, method_beta, args.seeds, benchmark, linear=linear)
         curves.update({f"{name}_{key}": value for key, value in histories.items()})
     summary["paired_novar_minus_pd_powers"] = paired_comparison(
         summary["methods"]["novar"], summary["methods"]["pd_powers"])
-    # Uniform random policy has deterministic expected values, requiring no rollout.
-    p_continue = np.mean([proba(0, a, 1) for a in range(ACTION)])
-    active_steps = sum(p_continue**h for h in range(H))
-    random_reward = np.array([active_steps * np.mean([reward(0, a, k) for a in range(ACTION)])
-                              + (H - active_steps) * TERMINAL_REWARD for k in range(K)])
-    random_utility = active_steps * np.mean([cost(0, a) for a in range(ACTION)])
-    curves["random_regret"] = np.cumsum(benchmark - random_reward)[None, :]
-    curves["random_deficit"] = np.cumsum(np.full(K, B_CONSTR - random_utility))[None, :]
+    summary["paired_linear_minus_pd_powers"] = paired_comparison(
+        summary["methods"]["linear_cmdp"], summary["methods"]["pd_powers"])
     save_json(args.output_dir / "comparison.json", summary)
     np.savez_compressed(args.output_dir / "curves.npz", **curves)
     plot_comparison(curves, args.output_dir)

@@ -93,15 +93,18 @@ class BaselineTests(unittest.TestCase):
     def test_cli_writes_disclosed_comparison_and_genuine_curve_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
             args = ["experiment", "--episodes", "4", "--seeds", "7", "8",
-                    "--baseline-beta", "1.75", "--output-dir", directory]
+                    "--baseline-beta", "1.75", "--linear-beta", "7.25", "--output-dir", directory]
             with patch("sys.argv", args), redirect_stdout(StringIO()):
                 experiment.main()
             summary = json.loads((Path(directory) / "comparison.json").read_text())
             self.assertIn("illustrative", summary["purpose"])
             self.assertEqual(summary["methods"]["novar"]["beta"], 1.75)
-            self.assertEqual(set(summary["methods"]), {"pd_powers", "novar"})
+            self.assertEqual(set(summary["methods"]), {"pd_powers", "novar", "linear_cmdp"})
+            self.assertEqual(summary["methods"]["linear_cmdp"]["beta"], 7.25)
+            self.assertEqual(summary["methods"]["linear_cmdp"]["algorithm_settings"]["feature_dimension"],
+                             2 * experiment.H + 2)
             with np.load(Path(directory) / "curves.npz") as curves:
-                for method in ("pd_powers", "novar"):
+                for method in ("pd_powers", "novar", "linear_cmdp"):
                     for index, row in enumerate(summary["methods"][method]["runs"]):
                         self.assertAlmostEqual(curves[f"{method}_regret"][index, -1], row["regret"])
                         self.assertAlmostEqual(max(0, curves[f"{method}_deficit"][index, -1]), row["violation"])

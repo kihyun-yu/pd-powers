@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PD-POWERS sensitivity with the original S=H+2 and A=2**(d-1) couplings."""
+"""PD-POWERS sensitivity: vary H, S, A, and d together in paired settings."""
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -78,39 +78,35 @@ def run_setting(horizon, dimension, episodes, budget_ratio, seeds):
 
 def plot_sensitivity(summary, curves, output_dir):
     episodes = np.arange(1, summary["episodes"] + 1)
-    panels = summary["panels"]
     for metric, ylabel in (("regret", "Regret"), ("deficit", "Constraint violation")):
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
-        for ax, panel in zip(axes, panels):
-            for key in panel["settings"]:
-                settings = summary["settings"][key]["settings"]
-                label = (f"H = {settings['H']}, S = {settings['STATE']}"
-                         if panel["axis"] == "horizon"
-                         else f"A = {settings['ACTION']}, d = {settings['dim']}")
-                values = curves[f"{key}_{metric}"]
-                if metric == "deficit":
-                    # Positive part per run, BEFORE averaging across seeds.
-                    values = np.maximum(0, values)
-                mean = values.mean(axis=0)
-                line, = ax.plot(episodes, mean, label=label, linewidth=1.8)
-                if len(values) > 1:
-                    half_width = 1.96 * values.std(axis=0, ddof=1) / np.sqrt(len(values))
-                    ax.fill_between(episodes, mean - half_width, mean + half_width,
-                                    color=line.get_color(), alpha=.18, linewidth=0)
-            ax.set(title=panel["title"], xlabel="Episode", ylabel=ylabel)
-            ax.legend(frameon=False, fontsize=10)
-            ax.grid(alpha=.18)
-            ax.set_xlim(1, max(2, summary["episodes"]))
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for key, row in summary["settings"].items():
+            settings = row["settings"]
+            label = (f"H = {settings['H']}, S = {settings['STATE']}, "
+                     f"A = {settings['ACTION']}, d = {settings['dim']}")
+            values = curves[f"{key}_{metric}"]
             if metric == "deficit":
-                ax.set_ylim(bottom=0)
-        fig.suptitle("PD-POWERS sensitivity", fontsize=15)
+                # Positive part per run, BEFORE averaging across seeds.
+                values = np.maximum(0, values)
+            mean = values.mean(axis=0)
+            line, = ax.plot(episodes, mean, label=label, linewidth=1.8)
+            if len(values) > 1:
+                half_width = 1.96 * values.std(axis=0, ddof=1) / np.sqrt(len(values))
+                ax.fill_between(episodes, mean - half_width, mean + half_width,
+                                color=line.get_color(), alpha=.18, linewidth=0)
+        # ax.set(title="PD-POWERS: vary H, S, A, and d together", xlabel="Episode", ylabel=ylabel)
+        ax.legend(frameon=False, fontsize=10)
+        ax.grid(alpha=.18)
+        ax.set_xlim(1, max(2, summary["episodes"]))
+        if metric == "deficit":
+            ax.set_ylim(bottom=0)
         band_note = ("Approximate pointwise 95% confidence bands"
                      if len(summary["evaluation_seeds"]) > 1 else "One seed; no confidence band")
-        fig.text(.5, .025,
-                 f"{len(summary['evaluation_seeds'])} seeds · {band_note} · "
-                 f"Utility threshold b = {summary['budget_ratio']:g}H",
-                 ha="center", fontsize=9, color=".35")
-        fig.tight_layout(rect=(0, .065, 1, .95))
+        # fig.text(.5, .025,
+        #          f"{len(summary['evaluation_seeds'])} seeds · {band_note}\n"
+        #          f"Utility threshold b = {summary['budget_ratio']:g}H",
+        #          ha="center", fontsize=9, color=".35")
+        fig.tight_layout(rect=(0, .10, 1, 1))
         filename = "sensitivity_regret.jpg" if metric == "regret" else "sensitivity_violation.jpg"
         try:
             fig.savefig(output_dir / filename, dpi=180)
@@ -121,13 +117,9 @@ def plot_sensitivity(summary, curves, output_dir):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--horizons", type=int, nargs="+", default=[5, 8, 10],
-                        help="H values at fixed d; S=H+2 (default: 5 8 10)")
+                        help="H values paired by position with --dimensions; S=H+2 (default: 5 8 10)")
     parser.add_argument("--dimensions", type=int, nargs="+", default=[3, 4, 5],
-                        help="d values at fixed H; A=2**(d-1) (default: 3 4 5)")
-    parser.add_argument("--reference-horizon", type=int, default=experiment.H,
-                        help="Fixed H for the A/d sweep (default: 10)")
-    parser.add_argument("--reference-dimension", type=int, default=experiment.dim,
-                        help="Fixed d for the H/S sweep (default: 5)")
+                        help="d values paired by position with --horizons; A=2**(d-1) (default: 3 4 5)")
     parser.add_argument("--budget-ratio", type=float,
                         default=experiment.B_CONSTR / experiment.H,
                         help="Utility lower bound b/H, held fixed (default: 0.6)")
@@ -147,12 +139,11 @@ def main(argv=None):
         parser.error("Workers must be positive")
     if len(set(args.seeds)) != len(args.seeds) or not all(0 <= s < 2**32 for s in args.seeds):
         parser.error("Provide unique seeds in [0, 2**32)")
+    if len(args.horizons) != len(args.dimensions):
+        parser.error("Provide the same number of horizons and dimensions; H and d are paired by position")
     if len(set(args.horizons)) != len(args.horizons) or len(set(args.dimensions)) != len(args.dimensions):
-        parser.error("Horizon and dimension lists must each contain unique values")
-    horizon_settings = [(h, args.reference_dimension) for h in args.horizons]
-    action_settings = [(args.reference_horizon, d) for d in args.dimensions]
-    # The shared reference is evaluated once and appears in both panels.
-    configurations = list(dict.fromkeys(horizon_settings + action_settings))
+        parser.error("Horizons and dimensions must each be unique so all four sizes change together")
+    configurations = list(zip(args.horizons, args.dimensions))
     try:
         for horizon, dimension in configurations:
             validate_setting(horizon, dimension, args.episodes, args.budget_ratio)
@@ -163,25 +154,19 @@ def main(argv=None):
     output_dir.mkdir(parents=True, exist_ok=True)
     plot_dir.mkdir(parents=True, exist_ok=True)
     summary = {
-        "purpose": "PD-POWERS sensitivity under coupled environment sizes",
+        "purpose": "PD-POWERS sensitivity with H, S, A, and d varied together",
         "method": "pd_powers", "episodes": args.episodes,
         "evaluation_seeds": args.seeds, "budget_ratio": args.budget_ratio,
         "couplings": {"S": "H + 2", "A": "2 ** (d - 1)"},
-        "interpretation": "Joint H/S and A/d sensitivity, not independent H, S, A effects. "
+        "pairing": "H and d are paired by list position; S and A are derived for each pair",
+        "interpretation": "All four sizes vary together across configurations. "
+                          "The curves measure their combined effect. "
                           "Hyperparameters are held fixed; b scales with H. "
                           "Each setting has its own feasible fixed-action comparator.",
         "metric": "Exact expected deployed-policy values; regret against the best feasible "
                   "deterministic fixed action (may be negative); violation is the positive "
                   "part of cumulative utility deficit, taken separately per seed.",
         "uncertainty": "Mean +/- 1.96 times sample standard error across seeds, pointwise",
-        "panels": [
-            {"axis": "horizon", "title": f"Vary H and S (A = {2 ** (args.reference_dimension - 1)}, "
-                                         f"d = {args.reference_dimension})",
-             "settings": [setting_id(*pair) for pair in horizon_settings]},
-            {"axis": "action", "title": f"Vary A and d (H = {args.reference_horizon}, "
-                                        f"S = {args.reference_horizon + 2})",
-             "settings": [setting_id(*pair) for pair in action_settings]},
-        ],
         "settings": {},
     }
     curves = {}

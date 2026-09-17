@@ -6,9 +6,10 @@ import matplotlib.pyplot as plt
 import warnings
 import argparse
 import json
-import shutil
 from pathlib import Path
 from typing import Optional
+
+PLOT_DIR = Path(__file__).resolve().parent / "plots"
 
 try:
     from tqdm.auto import tqdm
@@ -686,8 +687,8 @@ def plot_comparison(curves, output_dir):
     styles = {"novar": "--", "linear_cmdp": "-."}
     colors = {"random": "C0", "pd_powers": "C1", "novar": "C2", "linear_cmdp": "C3"}
     episodes = np.arange(1, K + 1)
-    for metric, filename, ylabel in (("regret", "regret_plot.jpg", "Regret"),
-                                     ("violation", "violation_plot.jpg", "Constraint Violation")):
+    for metric, filename, ylabel in (("regret", "comparison_regret.jpg", "Regret"),
+                                     ("violation", "comparison_violation.jpg", "Constraint Violation")):
         fig, ax = plt.subplots(figsize=(8, 5))
         for name in labels:
             values = curves[f"{name}_{'regret' if metric == 'regret' else 'deficit'}"]
@@ -724,7 +725,9 @@ def main():
     parser.add_argument("--episodes", type=int, default=K)
     parser.add_argument("--seeds", type=int, nargs="+", default=list(range(BASE_SEED, BASE_SEED + repeat)))
     parser.add_argument("--output-dir", type=Path,
-                        help="Custom output directory; otherwise save under the script's results/no_variance_baseline and refresh its root plots")
+                        help="Raw data directory (default: results/no_variance_baseline)")
+    parser.add_argument("--plot-dir", type=Path, default=PLOT_DIR,
+                        help="Shared plot directory (default: the project's plots folder)")
     parser.add_argument("--calibrate-demo", action="store_true",
                         help="Choose no-var beta to target a 5–15%% illustrative regret gap, not its best performance")
     parser.add_argument("--beta-grid", type=float, nargs="+", default=[0.35, 0.75, 1.25, 1.75, 1.9, 2.0, 2.1, 2.25, 2.75])
@@ -745,11 +748,13 @@ def main():
         parser.error("Evaluation and calibration seeds must be disjoint")
     K = args.episodes
     project_dir = Path(__file__).resolve().parent
-    default_output = args.output_dir is None
-    args.output_dir = (project_dir / "results/no_variance_baseline" if default_output
+    args.output_dir = (project_dir / "results/no_variance_baseline" if args.output_dir is None
                        else args.output_dir.expanduser()).resolve()
+    args.plot_dir = args.plot_dir.expanduser().resolve()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Results directory: {args.output_dir}\nPlots are updated after all runs finish.", flush=True)
+    args.plot_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Results directory: {args.output_dir}\nPlot directory: {args.plot_dir}\n"
+          "Plots are updated after all runs finish.", flush=True)
     action = select_constrained_optimal_action()
     benchmark = np.asarray([expected_episode_values_for_action(action, k)[0] for k in range(K)])
     random_curves = random_policy_curves(benchmark)
@@ -823,15 +828,9 @@ def main():
         summary["methods"]["linear_cmdp"], summary["methods"]["pd_powers"])
     save_json(args.output_dir / "comparison.json", summary)
     np.savez_compressed(args.output_dir / "curves.npz", **curves)
-    plot_comparison(curves, args.output_dir)
-    if default_output:
-        for filename in ("regret_plot.jpg", "violation_plot.jpg"):
-            source, destination = args.output_dir / filename, project_dir / filename
-            if source != destination:
-                shutil.copyfile(source, destination)
-        print(f"Updated project plots: {project_dir / 'regret_plot.jpg'}\n"
-              f"                       {project_dir / 'violation_plot.jpg'}", flush=True)
+    plot_comparison(curves, args.plot_dir)
     print(f"Saved comparison to {args.output_dir}", flush=True)
+    print(f"Saved comparison plots to {args.plot_dir}", flush=True)
 
 
 if __name__ == "__main__":
